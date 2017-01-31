@@ -1,22 +1,20 @@
+import logging
 from asyncio import get_event_loop
 from collections import deque
 from functools import partial
 from inspect import isawaitable, stack, getmodulename
-from multiprocessing import Process, Event
-from signal import signal, SIGTERM, SIGINT
 from traceback import format_exc
-import logging
+import warnings
 
 from .config import Config
+from .constants import HTTP_METHODS
 from .exceptions import Handler
+from .exceptions import ServerError
 from .log import log
 from .response import HTTPResponse
 from .router import Router
-from .server import serve, HttpProtocol
+from .server import serve, serve_multiple, HttpProtocol
 from .static import register as static_register
-from .exceptions import ServerError
-from socket import socket, SOL_SOCKET, SO_REUSEADDR
-from os import set_inheritable
 
 
 class Sanic:
@@ -42,7 +40,6 @@ class Sanic:
         self.response_middleware = deque()
         self.blueprints = {}
         self._blueprint_order = []
-        self.loop = None
         self.debug = None
         self.sock = None
         self.processes = None
@@ -95,7 +92,10 @@ class Sanic:
     def patch(self, uri, host=None):
         return self.route(uri, methods=["PATCH"], host=host)
 
-    def add_route(self, handler, uri, methods=None, host=None):
+    def delete(self, uri, host=None):
+        return self.route(uri, methods=["DELETE"], host=host)
+
+    def add_route(self, handler, uri, methods=frozenset({'GET'}), host=None):
         """
         A helper method to register class instance or
         functions as a handler to the application url
@@ -103,9 +103,13 @@ class Sanic:
 
         :param handler: function or class instance
         :param uri: path of the URL
-        :param methods: list or tuple of methods allowed
+        :param methods: list or tuple of methods allowed, these are overridden
+                        if using a HTTPMethodView
         :return: function or class instance
         """
+        # Handle HTTPMethodView differently
+        if hasattr(handler, 'view_class'):
+            methods = frozenset(HTTP_METHODS)
         self.route(uri=uri, methods=methods, host=host)(handler)
         return handler
 
@@ -180,9 +184,12 @@ class Sanic:
 
     def register_blueprint(self, *args, **kwargs):
         # TODO: deprecate 1.0
-        log.warning("Use of register_blueprint will be deprecated in "
-                    "version 1.0.  Please use the blueprint method instead",
-                    DeprecationWarning)
+        if self.debug:
+            warnings.simplefilter('default')
+        warnings.warn("Use of register_blueprint will be deprecated in "
+                      "version 1.0.  Please use the blueprint method"
+                      " instead",
+                      DeprecationWarning)
         return self.blueprint(*args, **kwargs)
 
     # -------------------------------------------------------------------- #
@@ -296,13 +303,74 @@ class Sanic:
         :param sock: Socket for the server to accept connections from
         :param workers: Number of processes
                         received before it is respected
-        :param loop: asyncio compatible event loop
         :param protocol: Subclass of asyncio protocol class
         :return: Nothing
         """
+        server_settings = self._helper(
+            host=host, port=port, debug=debug, before_start=before_start,
+            after_start=after_start, before_stop=before_stop,
+            after_stop=after_stop, ssl=ssl, sock=sock, workers=workers,
+            loop=loop, protocol=protocol, backlog=backlog,
+            stop_event=stop_event, register_sys_signals=register_sys_signals)
+        try:
+            if workers == 1:
+                serve(**server_settings)
+            else:
+                serve_multiple(server_settings, workers, stop_event)
+
+        except Exception as e:
+            log.exception(
+                'Experienced exception while trying to serve')
+
+        log.info("Server Stopped")
+
+    def stop(self):
+        """This kills the Sanic"""
+        get_event_loop().stop()
+
+    async def create_server(self, host="127.0.0.1", port=8000, debug=False,
+                            before_start=None, after_start=None,
+                            before_stop=None, after_stop=None, ssl=None,
+                            sock=None, loop=None, protocol=HttpProtocol,
+                            backlog=100, stop_event=None):
+        """
+        Asynchronous version of `run`.
+        """
+        server_settings = self._helper(
+            host=host, port=port, debug=debug, before_start=before_start,
+            after_start=after_start, before_stop=before_stop,
+            after_stop=after_stop, ssl=ssl, sock=sock, loop=loop,
+            protocol=protocol, backlog=backlog, stop_event=stop_event,
+            async_run=True)
+
+        # Serve
+        proto = "http"
+        if ssl is not None:
+            proto = "https"
+        log.info('Goin\' Fast @ {}://{}:{}'.format(proto, host, port))
+
+        return await serve(**server_settings)
+
+    def _helper(self, host="127.0.0.1", port=8000, debug=False,
+                before_start=None, after_start=None, before_stop=None,
+                after_stop=None, ssl=None, sock=None, workers=1, loop=None,
+                protocol=HttpProtocol, backlog=100, stop_event=None,
+                register_sys_signals=True, run_async=False):
+        """
+        Helper function used by `run` and `create_server`.
+        """
+
         self.error_handler.debug = debug
         self.debug = debug
-        self.loop = loop
+        self.loop = loop = get_event_loop()
+
+        if loop is not None:
+            if self.debug:
+                warnings.simplefilter('default')
+            warnings.warn("Passing a loop will be deprecated in version"
+                          " 0.4.0 https://github.com/channelcat/sanic/"
+                          "pull/335 has more information.",
+                          DeprecationWarning)
 
         server_settings = {
             'protocol': protocol,
@@ -347,72 +415,13 @@ class Sanic:
             log.setLevel(logging.DEBUG)
         log.debug(self.config.LOGO)
 
+        if run_async:
+            server_settings['run_async'] = True
+
         # Serve
-        if ssl is None:
-            proto = "http"
-        else:
+        proto = "http"
+        if ssl is not None:
             proto = "https"
         log.info('Goin\' Fast @ {}://{}:{}'.format(proto, host, port))
 
-        try:
-            if workers == 1:
-                serve(**server_settings)
-            else:
-                log.info('Spinning up {} workers...'.format(workers))
-
-                self.serve_multiple(server_settings, workers, stop_event)
-
-        except Exception as e:
-            log.exception(
-                'Experienced exception while trying to serve')
-
-        log.info("Server Stopped")
-
-    def stop(self):
-        """
-        This kills the Sanic
-        """
-        if self.processes is not None:
-            for process in self.processes:
-                process.terminate()
-            self.sock.close()
-        get_event_loop().stop()
-
-    def serve_multiple(self, server_settings, workers, stop_event=None):
-        """
-        Starts multiple server processes simultaneously.  Stops on interrupt
-        and terminate signals, and drains connections when complete.
-
-        :param server_settings: kw arguments to be passed to the serve function
-        :param workers: number of workers to launch
-        :param stop_event: if provided, is used as a stop signal
-        :return:
-        """
-        server_settings['reuse_port'] = True
-
-        # Create a stop event to be triggered by a signal
-        if stop_event is None:
-            stop_event = Event()
-        signal(SIGINT, lambda s, f: stop_event.set())
-        signal(SIGTERM, lambda s, f: stop_event.set())
-
-        self.sock = socket()
-        self.sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.sock.bind((server_settings['host'], server_settings['port']))
-        set_inheritable(self.sock.fileno(), True)
-        server_settings['sock'] = self.sock
-        server_settings['host'] = None
-        server_settings['port'] = None
-
-        self.processes = []
-        for _ in range(workers):
-            process = Process(target=serve, kwargs=server_settings)
-            process.daemon = True
-            process.start()
-            self.processes.append(process)
-
-        for process in self.processes:
-            process.join()
-
-        # the above processes will block this until they're stopped
-        self.stop()
+        return server_settings

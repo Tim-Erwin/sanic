@@ -9,14 +9,15 @@ async def local_request(method, uri, cookies=None, *args, **kwargs):
     url = 'http://{host}:{port}{uri}'.format(host=HOST, port=PORT, uri=uri)
     log.info(url)
     async with aiohttp.ClientSession(cookies=cookies) as session:
-        async with getattr(session, method)(url, *args, **kwargs) as response:
+        async with getattr(
+                session, method.lower())(url, *args, **kwargs) as response:
             response.text = await response.text()
             response.body = await response.read()
             return response
 
 
 def sanic_endpoint_test(app, method='get', uri='/', gather_request=True,
-                        loop=None, debug=False, server_kwargs={},
+                        debug=False, server_kwargs={},
                         *request_args, **request_kwargs):
     results = []
     exceptions = []
@@ -36,7 +37,7 @@ def sanic_endpoint_test(app, method='get', uri='/', gather_request=True,
         app.stop()
 
     app.run(host=HOST, debug=debug, port=PORT,
-            after_start=_collect_response, loop=loop, **server_kwargs)
+            after_start=_collect_response, **server_kwargs)
 
     if exceptions:
         raise ValueError("Exception during request: {}".format(exceptions))
